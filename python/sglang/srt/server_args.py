@@ -2236,8 +2236,90 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
+    # Step 1: pre-parse to obtain optional --config without triggering required-arg checks
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, help="Path to YAML config file to set server arguments")
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    # Step 2: build the full parser
     parser = argparse.ArgumentParser()
+    # keep --config in the full parser so it shows up in help and doesn't error
+    parser.add_argument("--config", type=str, help="Path to YAML config file to set server arguments")
     ServerArgs.add_cli_args(parser)
+
+    # Step 3: if --config provided, load YAML and set as parser defaults so CLI can override
+    if getattr(pre_args, "config", None):
+        config_path = pre_args.config
+        try:
+            import yaml  # type: ignore
+        except Exception as e:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "PyYAML is required to use --config. Please install with `pip install pyyaml`."
+            ) from e
+
+        with open(config_path, "r") as f:
+            yaml_cfg = yaml.safe_load(f) or {}
+            if not isinstance(yaml_cfg, dict):
+                raise ValueError("Top-level YAML must be a mapping of argument names to values")
+
+        # Build a mapping from various key forms to argparse dest names
+        option_to_dest: dict[str, str] = {}
+        for action in parser._actions:
+            dest = action.dest
+            # direct dest
+            if dest:
+                option_to_dest[dest] = dest
+                option_to_dest[dest.replace("_", "-")] = dest
+            for opt in getattr(action, "option_strings", []):
+                if opt.startswith("-"):
+                    key = opt.lstrip("-")
+                    option_to_dest[key] = dest
+                    option_to_dest[key.replace("-", "_")] = dest
+        # common aliases from dataclass fields to CLI dest
+        alias_map = {
+            "tp_size": "tensor_parallel_size",
+            "pp_size": "pipeline_parallel_size",
+            "dp_size": "data_parallel_size",
+            "ep_size": "expert_parallel_size",
+        }
+
+        # Certain fields accept JSON strings but users may supply YAML dicts
+        json_string_fields = {
+            "json_model_override_args",
+            "model_loader_extra_config",
+            "kv_events_config",
+            "deepep_config",
+        }
+
+        defaults: dict[str, object] = {}
+        for raw_key, value in yaml_cfg.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip()
+            # normalize key
+            norm = key
+            if norm in alias_map:
+                norm = alias_map[norm]
+            # look up dest
+            dest = option_to_dest.get(norm)
+            if dest is None:
+                # try normalized forms
+                norm2 = norm.replace("-", "_")
+                dest = option_to_dest.get(norm2)
+            if dest is None:
+                # ignore unknown keys silently to be forward compatible
+                continue
+
+            # Convert dict -> JSON string for string-typed JSON fields
+            if dest in json_string_fields and isinstance(value, (dict, list)):
+                value = json.dumps(value)
+
+            defaults[dest] = value
+
+        if defaults:
+            parser.set_defaults(**defaults)
+
+    # Step 4: parse final args and construct ServerArgs
     raw_args = parser.parse_args(argv)
     server_args = ServerArgs.from_cli_args(raw_args)
     return server_args
