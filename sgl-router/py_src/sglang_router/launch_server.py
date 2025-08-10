@@ -16,6 +16,12 @@ from sglang_router.launch_router import RouterArgs, launch_router
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
+from typing import Any, Optional
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 def setup_logger():
@@ -149,6 +155,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Launch SGLang router and server processes"
     )
+    # Early config flag for YAML
+    parser.add_argument("--config", type=str, default=os.getenv("SGLANG_CONFIG"), help="Path to YAML config file with server/router settings")
 
     ServerArgs.add_cli_args(parser)
     RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
@@ -159,7 +167,110 @@ def main():
         help="Base port number for data parallel workers",
     )
 
-    args = parser.parse_args()
+    # Merge YAML config (if provided) into CLI args with CLI taking precedence
+    def _normalize_key(k: str) -> str:
+        return k.replace("-", "_").lower()
+
+    def _server_key_to_dest(k: str) -> str:
+        k = _normalize_key(k)
+        if k in ("model",):
+            return "model_path"
+        if k in ("tp", "tp_size", "tensor_parallel_size"):
+            return "tensor_parallel_size"
+        if k in ("pp", "pp_size", "pipeline_parallel_size"):
+            return "pipeline_parallel_size"
+        if k in ("dp", "dp_size", "data_parallel_size"):
+            return "data_parallel_size"
+        if k in ("ep", "ep_size", "expert_parallel_size"):
+            return "expert_parallel_size"
+        return k
+
+    def _router_key_to_dest(k: str) -> str:
+        k = _normalize_key(k)
+        # prefix with router_
+        if k.startswith("router_"):
+            return k
+        return f"router_{k}"
+
+    def _option_dests_from_tokens(tokens: List[str]) -> set[str]:
+        dests = set()
+        opt_to_act = parser._option_string_actions  # type: ignore[attr-defined]
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith("--"):
+                opt = tok.split("=", 1)[0]
+                act = opt_to_act.get(opt)
+                if act is not None:
+                    dests.add(act.dest)
+                i += 1
+            i += 1
+        return dests
+
+    def _dest_to_flag(dest: str) -> Optional[str]:
+        for act in parser._actions:  # type: ignore[attr-defined]
+            if getattr(act, "dest", None) == dest:
+                for opt in getattr(act, "option_strings", []):
+                    if opt.startswith("--"):
+                        return opt
+        return None
+
+    def _append_flag(additions: List[str], dest: str, value: Any):
+        flag = _dest_to_flag(dest)
+        if not flag:
+            return
+        action = parser._option_string_actions.get(flag)  # type: ignore[attr-defined]
+        if isinstance(action, argparse._StoreTrueAction):  # type: ignore[attr-defined]
+            if bool(value):
+                additions.append(flag)
+        elif getattr(action, "nargs", None) in ("+", "*"):
+            if value is None:
+                return
+            additions.append(flag)
+            if isinstance(value, (list, tuple)):
+                additions.extend([str(x) for x in value])
+            else:
+                additions.append(str(value))
+        else:
+            if value is None:
+                return
+            additions.extend([flag, str(value)])
+
+    # Extract early argv without program name
+    raw_argv = sys.argv[1:]
+    explicit_dests = _option_dests_from_tokens(raw_argv)
+    yaml_additions: List[str] = []
+
+    if parser.parse_known_args(raw_argv)[0].config and yaml is not None:
+        cfg_path = parser.parse_known_args(raw_argv)[0].config
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        if not isinstance(cfg, dict):
+            raise ValueError("Top-level YAML must be a mapping")
+        server_cfg = cfg.get("server", cfg)
+        router_cfg = cfg.get("router", {})
+        if not isinstance(server_cfg, dict):
+            server_cfg = {}
+        if not isinstance(router_cfg, dict):
+            router_cfg = {}
+
+        # Server fields
+        for k, v in server_cfg.items():
+            dest = _server_key_to_dest(k)
+            if dest in explicit_dests:
+                continue
+            _append_flag(yaml_additions, dest, v)
+
+        # Router fields (dest must include router_ prefix)
+        for k, v in router_cfg.items():
+            dest = _router_key_to_dest(k)
+            if dest in explicit_dests:
+                continue
+            _append_flag(yaml_additions, dest, v)
+
+    # Re-parse with YAML-derived additions appended (so CLI wins)
+    args = parser.parse_args([*raw_argv, *yaml_additions])
+
     server_args = ServerArgs.from_cli_args(args)
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
 
