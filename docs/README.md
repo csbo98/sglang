@@ -108,3 +108,7 @@ Assistant: The capital of France is Paris."""
 ```
 
 This keeps responses aligned with expected behavior and improves reliability across different files.
+
+### Server YAML config
+
+See `docs/server_config.md` and `docs/server_config_example.yaml` for configuring the server via a single YAML file and running with `--config`.

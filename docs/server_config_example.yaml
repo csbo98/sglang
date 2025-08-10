@@ -1,0 +1,44 @@
+# Example SGLang server configuration
+# Save as config.yaml and run:
+#   python3 -m sglang.launch_server --config config.yaml
+
+# Model settings
+model: meta-llama/Meta-Llama-3-8B-Instruct
+revision: null
+trust-remote-code: true
+
+# Parallelism
+# You can use short aliases tp/pp/dp/ep or full names
+# tp maps to --tensor-parallel-size, etc.
+tp: 2
+pp: 1
+dp: 1
+ep: 1
+
+# HTTP server
+host: 0.0.0.0
+port: 30000
+api-key: null
+
+# Memory and scheduling
+mem-fraction-static: 0.88
+max-prefill-tokens: 16384
+schedule-policy: fcfs
+
+# Quantization and dtypes
+dtype: auto
+quantization: null
+kv-cache-dtype: auto
+
+# Logging
+log-level: info
+log-level-http: warning
+log-requests: false
+
+# Example of nested structure also supported by router launcher
+# router:
+#   worker-urls:
+#     - http://127.0.0.1:31001
+#     - http://127.0.0.1:31002
+#   policy: cache_aware
+#   prometheus-port: 29000

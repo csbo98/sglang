@@ -21,7 +21,8 @@ import os
 import random
 import sys
 import tempfile
-from typing import List, Literal, Optional, Union
+import pathlib
+from typing import List, Literal, Optional, Union, Any
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm100_supported
@@ -43,6 +44,11 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None  # Lazy optional dependency; tests may vendor PyYAML elsewhere
 
 
 @dataclasses.dataclass
@@ -2236,9 +2242,129 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
+    # Step 0: parse early --config (or env SGLANG_CONFIG) without polluting argv for the real parser
+    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser.add_argument("--config", type=str, default=os.getenv("SGLANG_CONFIG"))
+    early_known, early_remaining = early_parser.parse_known_args(argv)
+
+    # Build the real parser with all CLI args
     parser = argparse.ArgumentParser()
+    # Expose --config on the main parser too for better --help UX
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file with server settings")
     ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
+
+    # If config provided, convert YAML entries to CLI flags unless user already provided the flag explicitly
+    def _normalize_key_to_dest(key: str) -> str:
+        k = key.strip().replace("-", "_").lower()
+        # common aliases
+        if k in ("model",):
+            return "model_path"
+        if k in ("tp", "tp_size", "tensor_parallel_size"):
+            return "tensor_parallel_size"
+        if k in ("pp", "pp_size", "pipeline_parallel_size"):
+            return "pipeline_parallel_size"
+        if k in ("dp", "dp_size", "data_parallel_size"):
+            return "data_parallel_size"
+        if k in ("ep", "ep_size", "expert_parallel_size"):
+            return "expert_parallel_size"
+        return k
+
+    def _load_yaml_config(path: str) -> dict[str, Any]:
+        if path is None:
+            return {}
+        p = pathlib.Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+        if yaml is None:
+            raise RuntimeError("PyYAML is required to parse --config but is not installed")
+        with p.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("Top-level YAML must be a mapping")
+        # accept nested server: {...}
+        if "server" in data and isinstance(data["server"], dict):
+            base = data.get("server") or {}
+        else:
+            base = data
+        # normalize keys
+        norm: dict[str, Any] = {}
+        for k, v in base.items():
+            norm[_normalize_key_to_dest(k)] = v
+        return norm
+
+    def _collect_explicit_dests(argv_tokens: List[str]) -> set[str]:
+        explicit: set[str] = set()
+        # Map option string -> action (to find dest)
+        opt_to_act = parser._option_string_actions  # type: ignore[attr-defined]
+        i = 0
+        while i < len(argv_tokens):
+            tok = argv_tokens[i]
+            if tok.startswith("--"):
+                opt = tok.split("=", 1)[0]
+                act = opt_to_act.get(opt)
+                if act is not None and hasattr(act, "dest"):
+                    explicit.add(act.dest)
+                # skip value token for non-store_true if provided as separate token
+                i += 1
+            i += 1
+        return explicit
+
+    def _dest_to_primary_flag(dest: str) -> Optional[str]:
+        # Find the primary long option string for a given dest
+        for act in parser._actions:  # type: ignore[attr-defined]
+            if getattr(act, "dest", None) == dest:
+                for opt in getattr(act, "option_strings", []):
+                    if opt.startswith("--"):
+                        return opt
+        return None
+
+    def _yaml_to_cli_additions(cfg: dict[str, Any], explicit_dests: set[str]) -> List[str]:
+        additions: List[str] = []
+        json_string_dests = {
+            "json_model_override_args",
+            "model_loader_extra_config",
+            "preferred_sampling_params",
+            "kv_events_config",
+        }
+        for k, v in cfg.items():
+            dest = _normalize_key_to_dest(k)
+            if dest in explicit_dests:
+                continue
+            flag = _dest_to_primary_flag(dest)
+            if not flag:
+                continue  # unknown key; ignore silently
+            # Determine action to know how to serialize
+            action = parser._option_string_actions.get(flag)  # type: ignore[attr-defined]
+            # If the destination expects JSON string, serialize mapping/list values
+            if dest in json_string_dests and isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            if action is not None and getattr(action, "nargs", None) in ("+", "*"):
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple)):
+                    additions.append(flag)
+                    additions.extend([str(x) for x in v])
+                else:
+                    additions.append(flag)
+                    additions.append(str(v))
+            else:
+                if isinstance(action, argparse._StoreTrueAction):  # type: ignore[attr-defined]
+                    if bool(v):
+                        additions.append(flag)
+                elif v is None:
+                    continue
+                else:
+                    additions.append(flag)
+                    additions.append(str(v))
+        return additions
+
+    yaml_cfg = _load_yaml_config(early_known.config)
+    # Build final argv by appending YAML-derived flags after user-provided ones (so user wins)
+    explicit = _collect_explicit_dests(early_remaining)
+    yaml_cli = _yaml_to_cli_additions(yaml_cfg, explicit)
+    final_argv = [*early_remaining, *yaml_cli]
+
+    raw_args = parser.parse_args(final_argv)
     server_args = ServerArgs.from_cli_args(raw_args)
     return server_args
 
