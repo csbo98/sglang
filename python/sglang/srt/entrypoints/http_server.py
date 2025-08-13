@@ -1291,7 +1291,11 @@ def _execute_server_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
 ):
     headers = {}
-    url = server_args.url()
+    # Use localhost for warmup when binding to 0.0.0.0 to avoid proxy issues
+    if server_args.host == "0.0.0.0":
+        url = f"http://127.0.0.1:{server_args.port}"
+    else:
+        url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
