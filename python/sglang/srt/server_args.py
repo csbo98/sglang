@@ -21,7 +21,7 @@ import os
 import random
 import sys
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union, Dict
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm100_supported
@@ -57,6 +57,11 @@ class ServerArgs:
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
+    # Per-modality input limits for multimodal models
+    limit_mm_per_prompt: Optional[str] = None  # JSON string for per-modality limits
+    max_images_per_prompt: Optional[int] = None  # Maximum images per prompt
+    max_videos_per_prompt: Optional[int] = None  # Maximum videos per prompt  
+    max_audios_per_prompt: Optional[int] = None  # Maximum audios per prompt
     revision: Optional[str] = None
     model_impl: str = "auto"
 
@@ -679,6 +684,43 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
+    def parse_modality_limits(self) -> Dict[str, Optional[int]]:
+        """
+        Parse and return the modality limits configuration.
+        
+        Returns a dictionary with modality names as keys and limits as values.
+        Individual modality limits (e.g., max_images_per_prompt) override 
+        the general limit_mm_per_prompt configuration.
+        """
+        limits = {}
+        
+        # First, parse the JSON configuration if provided
+        if self.limit_mm_per_prompt:
+            try:
+                limits = json.loads(self.limit_mm_per_prompt)
+                if not isinstance(limits, dict):
+                    raise ValueError("limit_mm_per_prompt must be a JSON object")
+                # Normalize keys to lowercase
+                limits = {k.lower(): v for k, v in limits.items()}
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse limit_mm_per_prompt JSON: {e}")
+                limits = {}
+        
+        # Override with individual modality limits if specified
+        if self.max_images_per_prompt is not None:
+            limits["image"] = self.max_images_per_prompt
+        if self.max_videos_per_prompt is not None:
+            limits["video"] = self.max_videos_per_prompt
+        if self.max_audios_per_prompt is not None:
+            limits["audio"] = self.max_audios_per_prompt
+            
+        # Validate that all limits are non-negative
+        for modality, limit in limits.items():
+            if limit is not None and limit < 0:
+                raise ValueError(f"Modality limit for '{modality}' must be non-negative, got {limit}")
+                
+        return limits
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
@@ -770,6 +812,31 @@ class ServerArgs:
             default=ServerArgs.enable_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        )
+        parser.add_argument(
+            "--limit-mm-per-prompt",
+            type=str,
+            default=ServerArgs.limit_mm_per_prompt,
+            help='JSON string specifying per-modality limits, e.g., \'{"image": 5, "video": 2, "audio": 3}\'. '
+                 'This provides fine-grained control over multimodal inputs.',
+        )
+        parser.add_argument(
+            "--max-images-per-prompt",
+            type=int,
+            default=ServerArgs.max_images_per_prompt,
+            help="Maximum number of images allowed per prompt. Overrides limit-mm-per-prompt for images if set.",
+        )
+        parser.add_argument(
+            "--max-videos-per-prompt",
+            type=int,
+            default=ServerArgs.max_videos_per_prompt,
+            help="Maximum number of videos allowed per prompt. Overrides limit-mm-per-prompt for videos if set.",
+        )
+        parser.add_argument(
+            "--max-audios-per-prompt",
+            type=int,
+            default=ServerArgs.max_audios_per_prompt,
+            help="Maximum number of audio inputs allowed per prompt. Overrides limit-mm-per-prompt for audios if set.",
         )
         parser.add_argument(
             "--revision",

@@ -50,6 +50,13 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from aiohttp import ClientSession
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from huggingface_hub import HfFileSystem
+from PIL import Image
+from prometheus_client import Counter, Gauge, Histogram
+from transformers import AutoConfig
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -113,6 +120,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    GetMemPoolSizeReqInput,
+    ProfileReqInput,
+    RewardReqInput,
+    TokenizedRewardReqInput,
+    UpdateWeightReqInput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -128,6 +140,9 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.metrics.metrics_types import Stats
+from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.modality_limits import ModalityLimitConfig, ModalityLimitValidator
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -200,6 +215,16 @@ class TokenizerManager:
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
+
+        # Initialize modality limit validator
+        modality_limits = server_args.parse_modality_limits()
+        if modality_limits:
+            self.modality_validator = ModalityLimitValidator(
+                ModalityLimitConfig.from_dict(modality_limits)
+            )
+            logger.info(f"Initialized {self.modality_validator.get_summary()}")
+        else:
+            self.modality_validator = None
 
         if self.model_config.is_multimodal:
             import_processors()
@@ -540,6 +565,14 @@ class TokenizerManager:
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         if self.mm_processor and obj.contains_mm_input():
+            # Validate modality limits before processing
+            if self.modality_validator:
+                self.modality_validator.validate_request(
+                    image_data=obj.image_data,
+                    video_data=obj.video_data,
+                    audio_data=obj.audio_data,
+                )
+            
             if not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if not isinstance(obj.audio_data, list):
